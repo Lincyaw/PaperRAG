@@ -19,6 +19,11 @@ from llama_index.core.query_engine import RouterQueryEngine
 from llama_index.core import Document
 from llama_index.core import PromptTemplate
 from api_clients import *
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+logger.add("llama.log")
+
+checkpoint_lock = threading.Lock()
 
 # Define template for prompt
 template = (
@@ -37,15 +42,19 @@ Settings.embed_model = OllamaEmbedding(
     ollama_additional_kwargs={"mirostat": 0},
 )
 model = "llama3.1:70b"
-Settings.llm = Ollama(model=model, request_timeout=360.0, base_url="http://10.26.1.146:11434")
+Settings.llm = Ollama(model=model, request_timeout=360.0,
+                      base_url="http://10.26.1.146:11434")
+
 
 def load_documents(file_path: Path) -> List[Document]:
     return FlatReader().load_data(file=file_path)
+
 
 def split_documents(documents: List[Document]) -> List[Document]:
     text_splitter = MarkdownElementNodeParser()
     Settings.text_splitter = text_splitter
     return text_splitter.get_nodes_from_documents(documents)
+
 
 def generate_prompt(ctx: str) -> List[Dict]:
     return [
@@ -190,7 +199,8 @@ The results of the evaluation are shown in Figure 5. It can be seen that both th
         },
     ]
 
-def process_node(node, llama_client, model) -> Dict:
+
+def process_node_with_llm(node, llama_client, model) -> Dict:
     completion = llama_client.chat.completions.create(
         model=model,
         messages=generate_prompt(ctx=node.get_content()),
@@ -204,9 +214,12 @@ def process_node(node, llama_client, model) -> Dict:
     parse_result["original_content"] = node.get_content()
     return parse_result
 
+
 def save_checkpoint(data, checkpoint_file="checkpoint.json"):
-    with open(checkpoint_file, "w") as file:
-        json.dump(data, file, indent=4)
+    with checkpoint_lock:
+        with open(checkpoint_file, "w") as file:
+            json.dump(data, file, indent=4)
+
 
 def load_checkpoint(checkpoint_file="checkpoint.json"):
     if os.path.exists(checkpoint_file):
@@ -215,47 +228,73 @@ def load_checkpoint(checkpoint_file="checkpoint.json"):
     return {"document_info": [], "checkpoint_data": {}}
 
 
+def process_node(node, llama_client, model, file_str, node_idx, document_info, checkpoint_data, checkpoint_file):
+    try:
+        result = process_node_with_llm(node, llama_client, model)
+        result['file'] = file_str
+        result['node_index'] = node_idx
+        document_info.append(result)
 
-def process_documents(file_paths: List[Path], llama_client, model, output_file="paper.json", checkpoint_file="checkpoint.json"):
+        checkpoint_data[file_str] = {
+            "last_processed_node": node_idx, "completed": False}
+        save_checkpoint({"document_info": document_info,
+                        "checkpoint_data": checkpoint_data}, checkpoint_file)
+    except Exception as e:
+        logger.error(
+            f"Error processing node {node_idx} in file {file_str}: {e}")
+        raise
+
+
+def process_file(file_path, llama_client, model, document_info, checkpoint_data, checkpoint_file):
+    file_str = str(file_path)
+    if file_str in checkpoint_data and checkpoint_data[file_str]["completed"]:
+        return
+
+    try:
+        documents = load_documents(file_path)
+        nodes = split_documents(documents)
+
+        node_idx = checkpoint_data[file_str].get(
+            "last_processed_node", -1) + 1 if file_str in checkpoint_data else 0
+        while node_idx < len(nodes):
+            node = nodes[node_idx]
+            process_node(node, llama_client, model, file_str, node_idx,
+                         document_info, checkpoint_data, checkpoint_file)
+            node_idx += 1
+
+        checkpoint_data[file_str]["completed"] = True
+        save_checkpoint({"document_info": document_info,
+                        "checkpoint_data": checkpoint_data}, checkpoint_file)
+
+    except Exception as e:
+        logger.error(f"Error processing {file_path}: {e}")
+
+
+def process_documents(file_paths: List[Path], llama_client, model, output_file="outputs/paper.json", checkpoint_file="outputs/checkpoint.json"):
     checkpoint = load_checkpoint(checkpoint_file)
     document_info = checkpoint["document_info"]
     checkpoint_data = checkpoint["checkpoint_data"]
-    
-    processed_files = set(checkpoint_data.keys())
 
-    for file_path in file_paths:
-        file_str = str(file_path)
-        if file_str in processed_files and checkpoint_data[file_str]["completed"]:
-            continue
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(process_file, file_path, llama_client, model,
+                                   document_info, checkpoint_data, checkpoint_file) for file_path in file_paths]
 
-        try:
-            documents = load_documents(file_path)
-            nodes = split_documents(documents)
-
-            node_idx = checkpoint_data[file_str].get("last_processed_node", -1) + 1 if file_str in checkpoint_data else 0
-            while node_idx < len(nodes):
-                node = nodes[node_idx]
-                result = process_node(node, llama_client, model)
-                result['file'] = file_str
-                result['node_index'] = node_idx
-                document_info.append(result)
-
-                checkpoint_data[file_str] = {"last_processed_node": node_idx, "completed": False}
-                save_checkpoint({"document_info": document_info, "checkpoint_data": checkpoint_data}, checkpoint_file)
-
-                node_idx += 1
-
-            checkpoint_data[file_str]["completed"] = True
-            save_checkpoint({"document_info": document_info, "checkpoint_data": checkpoint_data}, checkpoint_file)
-
-        except Exception as e:
-            logger.error(f"Error processing {file_path}: {e}")
-            break
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Error in processing file: {e}")
 
     with open(output_file, "w") as file:
         json.dump(document_info, file, indent=4)
 
 
 if __name__ == "__main__":
-    files_to_process = [Path("./test_input/49.md"), Path("./test_input/other_file.md")]
+    files_to_process = []
+    for root, dirs, files in os.walk("inputs"):
+        for file in files:
+            if file.endswith(".md"):
+                file_path = os.path.join(root, file)
+                print(f"Path: {file_path}, File Name: {file}")
+                files_to_process.append(Path(file_path))
     process_documents(files_to_process, llama_client, model)
