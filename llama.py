@@ -10,8 +10,6 @@ from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Settings, 
 from llama_index.readers.file import FlatReader
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from loguru import logger
-import logging
-import sys
 from llama_index.core import VectorStoreIndex, get_response_synthesizer
 from llama_index.core.retrievers import VectorIndexRetriever, SummaryIndexLLMRetriever
 from llama_index.core.query_engine import RetrieverQueryEngine
@@ -19,12 +17,10 @@ from llama_index.core.postprocessor import SimilarityPostprocessor
 from llama_index.core.agent import ReActAgent
 from llama_index.core.query_engine import RouterQueryEngine
 from llama_index.core import Document
-# os.environ['TRACELOOP_API_KEY'] = '306bc930f638d0e04d7c48eed07e8628009930843ce489c2f7cd614223f8b073aaccd61bf22eec68369ed873ebb87628'
-# Traceloop.init()
 from llama_index.core import PromptTemplate
-
 from api_clients import *
 
+# Define template for prompt
 template = (
     "We have provided context information below. \n"
     "---------------------\n"
@@ -33,7 +29,8 @@ template = (
     "Given this information, please answer the question: {query_str}\n"
 )
 qa_template = PromptTemplate(template)
-# 配置 Ollama embedding 和 LLM
+
+# Configure embedding and LLM
 Settings.embed_model = OllamaEmbedding(
     model_name="nomic-embed-text:latest",
     base_url="http://10.26.1.146:11434",
@@ -42,15 +39,13 @@ Settings.embed_model = OllamaEmbedding(
 model = "llama3.1:70b"
 Settings.llm = Ollama(model=model, request_timeout=360.0, base_url="http://10.26.1.146:11434")
 
-documents = FlatReader().load_data(file=Path("./test_input/49.md"))
-text_splitter = MarkdownElementNodeParser()
-Settings.text_splitter = text_splitter
-index = VectorStoreIndex.from_documents(
-    documents, show_progress=True
-)
+def load_documents(file_path: Path) -> List[Document]:
+    return FlatReader().load_data(file=file_path)
 
-nodes = text_splitter.get_nodes_from_documents(documents)
-
+def split_documents(documents: List[Document]) -> List[Document]:
+    text_splitter = MarkdownElementNodeParser()
+    Settings.text_splitter = text_splitter
+    return text_splitter.get_nodes_from_documents(documents)
 
 def generate_prompt(ctx: str) -> List[Dict]:
     return [
@@ -131,7 +126,7 @@ The results of the evaluation are shown in Figure 5. It can be seen that both th
   "algorithm_efficiency": {
     "inference_time": {
       "description": "MicroHECL's execution time is 22.3% less than Microscope and 31.7% less than MonitorRank. It shows good scalability as execution time increases linearly with the number of services.",
-      "relevance": "High"
+      "relevance": "high"
     },
     "cost_effectiveness": {
       "description": "MicroHECL's pruning strategy reduces the number of nodes analyzed, thus reducing computational cost and improving efficiency.",
@@ -195,24 +190,72 @@ The results of the evaluation are shown in Figure 5. It can be seen that both th
         },
     ]
 
-
-document_info = []
-
-for n in nodes:
+def process_node(node, llama_client, model) -> Dict:
     completion = llama_client.chat.completions.create(
         model=model,
-        messages=generate_prompt(ctx=n.get_content()),
+        messages=generate_prompt(ctx=node.get_content()),
         temperature=0.1,
         response_format={"type": "json_object"},
     )
-    logger.info(f"input context: {n.get_content()}")
+    logger.info(f"input context: {node.get_content()}")
     content = completion.choices[0].message.content
     logger.info(f"response: {content}")
     parse_result = json.loads(completion.choices[0].message.content)
-    parse_result["original_content"] = content
-    document_info.append(parse_result)
+    parse_result["original_content"] = node.get_content()
+    return parse_result
 
-with open("paper.json", "w") as file:
-    json.dump(document_info, file, indent=4)
+def save_checkpoint(data, checkpoint_file="checkpoint.json"):
+    with open(checkpoint_file, "w") as file:
+        json.dump(data, file, indent=4)
+
+def load_checkpoint(checkpoint_file="checkpoint.json"):
+    if os.path.exists(checkpoint_file):
+        with open(checkpoint_file, "r") as file:
+            return json.load(file)
+    return {"document_info": [], "checkpoint_data": {}}
 
 
+
+def process_documents(file_paths: List[Path], llama_client, model, output_file="paper.json", checkpoint_file="checkpoint.json"):
+    checkpoint = load_checkpoint(checkpoint_file)
+    document_info = checkpoint["document_info"]
+    checkpoint_data = checkpoint["checkpoint_data"]
+    
+    processed_files = set(checkpoint_data.keys())
+
+    for file_path in file_paths:
+        file_str = str(file_path)
+        if file_str in processed_files and checkpoint_data[file_str]["completed"]:
+            continue
+
+        try:
+            documents = load_documents(file_path)
+            nodes = split_documents(documents)
+
+            node_idx = checkpoint_data[file_str].get("last_processed_node", -1) + 1 if file_str in checkpoint_data else 0
+            while node_idx < len(nodes):
+                node = nodes[node_idx]
+                result = process_node(node, llama_client, model)
+                result['file'] = file_str
+                result['node_index'] = node_idx
+                document_info.append(result)
+
+                checkpoint_data[file_str] = {"last_processed_node": node_idx, "completed": False}
+                save_checkpoint({"document_info": document_info, "checkpoint_data": checkpoint_data}, checkpoint_file)
+
+                node_idx += 1
+
+            checkpoint_data[file_str]["completed"] = True
+            save_checkpoint({"document_info": document_info, "checkpoint_data": checkpoint_data}, checkpoint_file)
+
+        except Exception as e:
+            logger.error(f"Error processing {file_path}: {e}")
+            break
+
+    with open(output_file, "w") as file:
+        json.dump(document_info, file, indent=4)
+
+
+if __name__ == "__main__":
+    files_to_process = [Path("./test_input/49.md"), Path("./test_input/other_file.md")]
+    process_documents(files_to_process, llama_client, model)
